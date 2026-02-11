@@ -4,6 +4,11 @@ Estructura minima para iniciar un proyecto multiagente con LangGraph.
 
 ## Incluye
 - Grafo base con 4 nodos: `router`, `researcher`, `builder`, `supervisor`.
+- Sistema de cotizacion persistente para autos usados con agentes de:
+  - cotizacion de inventario (`quote_agent`)
+  - solicitud de llamada (`contact_agent`)
+- Herramientas (`tools`) para consultar inventario y crear solicitudes de llamada.
+- Prompts versionados para router/cotizacion/contacto.
 - Dependencias separadas en runtime/dev.
 - Prueba smoke con `pytest`.
 - Configuracion para `langgraph dev`.
@@ -16,6 +21,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements-dev.txt
 cp .env.example .env
+python3 scripts/init_sqlite_db.py
 pytest -q
 langgraph dev
 ```
@@ -23,7 +29,8 @@ langgraph dev
 ## SQLite inventory
 
 Se agrego una base SQLite para una automotora de usados con:
-- tabla `vehicles` (inventario de autos),
+- tablas de referencia (`countries`, `body_types`, `fuel_types`, `transmission_types`, `drivetrains`),
+- tabla `vehicles` (inventario de autos con foreign keys a catálogos),
 - tabla `contact_requests` (solicitudes de contacto por vehiculo).
 
 ### Esquema
@@ -32,17 +39,17 @@ Archivo SQL:
 `app/db/schema.sql`
 
 Campos principales de `vehicles`:
-- `country_of_origin`
+- `country_id` (FK a `countries`)
 - `year`
 - `mileage_km`
 - `make`
 - `model`
 - `color`
 - `description`
-- `body_type`
-- `transmission_type`
-- `fuel_type`
-- `drivetrain`
+- `body_type_id` (FK a `body_types`)
+- `transmission_type_id` (FK a `transmission_types`)
+- `fuel_type_id` (FK a `fuel_types`)
+- `drivetrain_id` (FK a `drivetrains`)
 - `number_of_doors`
 
 Campos de `contact_requests`:
@@ -65,6 +72,113 @@ Opcional (path o cantidad personalizada, minimo 50):
 
 ```bash
 python3 scripts/init_sqlite_db.py --db-path data/mi_inventario.db --seed-count 75
+```
+
+### Migrar DB existente (esquema antiguo -> normalizado)
+
+Si ya tenías `dealership.db` del esquema viejo:
+
+```bash
+python3 scripts/migrate_inventory_db.py --db-path data/dealership.db
+```
+
+El script crea backup automático:
+`data/dealership.db.bak-pre-migration`
+
+Nota:
+- Los tools del asistente ahora validan el esquema al primer uso.
+- Si detectan esquema legacy, migran automáticamente antes de consultar inventario.
+- Si quieres limpiar una DB local y dejar solo el esquema actual (sin tablas legacy), re-inicializa:
+```bash
+python3 scripts/init_sqlite_db.py --db-path data/dealership.db
+```
+
+## Sistema de cotizacion persistente
+
+Nuevo grafo en:
+`app/car_sales_graph.py`
+
+Capacidades:
+- Conversacion persistente por `thread_id` (mensajes + estado de filtros/contacto).
+- Cotizacion por preferencias del usuario.
+- La IA construye consultas usando solo parámetros permitidos a través de `tools`.
+- SQL final siempre parametrizado y seguro (sin SQL raw del usuario).
+- Registro de solicitud de llamada en `contact_requests`.
+- Flujo Tool-Calling con `ToolNode` (estilo módulos del curso).
+
+### Parametros soportados para cotizar
+
+- `country_id`
+- `body_type_id`
+- `transmission_type_id`
+- `fuel_type_id`
+- `drivetrain_id`
+- `year_min`, `year_max`
+- `mileage_km_min`, `mileage_km_max`
+- `make`, `model`, `color`
+- `number_of_doors`
+- `price_usd_min`, `price_usd_max`
+- `limit`
+
+### Prompts y tools
+
+Prompts:
+- `app/prompts/car_sales_prompts.py`
+
+Tools:
+- `app/tools/car_sales_tools.py`
+  - `list_available_vehicle_filters`
+  - `search_used_vehicles`
+  - `get_vehicle_details`
+  - `create_executive_call_request`
+
+Nota:
+- `list_available_vehicle_filters` consulta catálogos reales en DB y entrega `id + name`.
+- El flujo de cotización es: consultar catálogo, elegir IDs, luego ejecutar `search_used_vehicles` con esos IDs.
+
+### Ejecutar chat persistente
+
+```bash
+cd pruebas/proyecto_multiagentes
+python3 scripts/run_car_sales_chat.py --thread-id demo-autos
+```
+
+Si vuelves a ejecutar con el mismo `thread-id`, la conversacion continua.
+
+Base de persistencia de conversaciones:
+`data/conversations.db`
+
+Variables opcionales:
+- `DEALERSHIP_DB_PATH` (default `data/dealership.db`)
+- `SHOW_SQL_DEBUG=true` para mostrar SQL generado por la IA en cada respuesta
+
+### Ejemplo de flujo
+
+1. \"Busco un SUV Toyota 2020 o más nuevo, menos de 80.000 km y hasta 26.000 USD\"
+2. El asistente devuelve opciones con `ID` de vehículo.
+3. \"Quiero que me llame un ejecutivo por el ID 12. Me llamo Ana, +541112345678, mañana 10:00\"
+4. Se inserta la fila en `contact_requests` y devuelve confirmación.
+
+### Probar en LangSmith Studio (chat habilitado)
+
+1. Ejecuta:
+```bash
+cd pruebas/proyecto_multiagentes
+langgraph dev
+```
+2. En Studio, selecciona el grafo `car_sales_assistant`.
+3. Crea/usa un `thread` para mantener conversación.
+4. Envía mensajes en el panel de chat.
+
+Si no ves chat habilitado:
+- verifica que elegiste `car_sales_assistant` (no `multiagente`),
+- verifica `OPENAI_API_KEY` en `.env`,
+- reinicia `langgraph dev` después de cambios.
+- si quedan asistentes viejos en Studio, borra estado local y reinicia: `rm -rf .langgraph_api && langgraph dev`
+- si aparece error `module 'langchain' has no attribute 'llm_cache'`, activa el virtualenv del proyecto y reinstala dependencias:
+```bash
+source .venv/bin/activate
+pip install -r requirements-dev.txt
 ```
 
 ## API keys
@@ -161,7 +275,10 @@ PY
 
 ## Grafo actual
 
-Flujo:
+Grafo base (`app/graph.py`):
 `START -> router -> (researcher | builder | supervisor)`
 `researcher -> builder -> supervisor -> END`
 `supervisor -> END`
+
+Grafo de ventas (`app/car_sales_graph.py`):
+`START -> router -> (quote_agent | contact_agent) -> END`

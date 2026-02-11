@@ -11,6 +11,41 @@ DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "dealership.db"
 SCHEMA_PATH = PROJECT_ROOT / "app" / "db" / "schema.sql"
 
 
+COUNTRIES = [
+    "Brazil",
+    "Canada",
+    "China",
+    "France",
+    "Germany",
+    "Japan",
+    "Mexico",
+    "Romania",
+    "South Korea",
+    "Sweden",
+    "Thailand",
+    "United States",
+]
+
+BODY_TYPES = ["Hatchback", "Pickup", "SUV", "Sedan"]
+TRANSMISSION_TYPES = ["Automatic", "CVT", "Dual-Clutch", "Manual"]
+FUEL_TYPES = ["Diesel", "Electric", "Flex Fuel", "Gasoline", "Hybrid", "Plug-in Hybrid"]
+DRIVETRAINS = ["4WD", "AWD", "FWD", "RWD"]
+
+
+def _insert_dimension(conn: sqlite3.Connection, table: str, values: list[str]) -> dict[str, int]:
+    conn.executemany(f"INSERT INTO {table} (name) VALUES (?);", [(value,) for value in values])
+    rows = conn.execute(f"SELECT id, name FROM {table};").fetchall()
+    return {name: int(row_id) for row_id, name in rows}
+
+
+def seed_reference_data(conn: sqlite3.Connection) -> None:
+    _insert_dimension(conn, "countries", COUNTRIES)
+    _insert_dimension(conn, "body_types", BODY_TYPES)
+    _insert_dimension(conn, "transmission_types", TRANSMISSION_TYPES)
+    _insert_dimension(conn, "fuel_types", FUEL_TYPES)
+    _insert_dimension(conn, "drivetrains", DRIVETRAINS)
+
+
 def generate_seed_vehicles(count: int = 60) -> list[dict[str, Any]]:
     """Generate deterministic used-car inventory rows."""
 
@@ -79,7 +114,10 @@ def generate_seed_vehicles(count: int = 60) -> list[dict[str, Any]]:
         year = 2011 + (i % 14)  # 2011..2024
         mileage_base = 180_000 - ((year - 2011) * 8_000)
         mileage_km = max(8_000, mileage_base + rng.randint(-12_000, 12_000))
-        price_usd = max(5_500, 7_000 + ((year - 2011) * 900) - (mileage_km // 130) + rng.randint(-1_500, 2_500))
+        price_usd = max(
+            5_500,
+            7_000 + ((year - 2011) * 900) - (mileage_km // 130) + rng.randint(-1_500, 2_500),
+        )
         color = colors[i % len(colors)]
         stock_code = f"UC-{year}-{i + 1:03d}"
 
@@ -112,6 +150,88 @@ def generate_seed_vehicles(count: int = 60) -> list[dict[str, Any]]:
     return vehicles
 
 
+def _build_reference_maps(conn: sqlite3.Connection) -> dict[str, dict[str, int]]:
+    maps: dict[str, dict[str, int]] = {}
+    for table, key in [
+        ("countries", "country"),
+        ("body_types", "body_type"),
+        ("transmission_types", "transmission_type"),
+        ("fuel_types", "fuel_type"),
+        ("drivetrains", "drivetrain"),
+    ]:
+        rows = conn.execute(f"SELECT id, name FROM {table};").fetchall()
+        maps[key] = {name: int(row_id) for row_id, name in rows}
+    return maps
+
+
+def insert_vehicles(conn: sqlite3.Connection, vehicles: list[dict[str, Any]]) -> None:
+    maps = _build_reference_maps(conn)
+
+    payload: list[dict[str, Any]] = []
+    for vehicle in vehicles:
+        payload.append(
+            {
+                "stock_code": vehicle["stock_code"],
+                "country_id": maps["country"][vehicle["country_of_origin"]],
+                "year": vehicle["year"],
+                "mileage_km": vehicle["mileage_km"],
+                "make": vehicle["make"],
+                "model": vehicle["model"],
+                "color": vehicle["color"],
+                "description": vehicle["description"],
+                "body_type_id": maps["body_type"][vehicle["body_type"]],
+                "transmission_type_id": maps["transmission_type"][vehicle["transmission_type"]],
+                "fuel_type_id": maps["fuel_type"][vehicle["fuel_type"]],
+                "drivetrain_id": maps["drivetrain"][vehicle["drivetrain"]],
+                "number_of_doors": vehicle["number_of_doors"],
+                "engine": vehicle["engine"],
+                "price_usd": vehicle["price_usd"],
+                "is_available": vehicle["is_available"],
+            }
+        )
+
+    conn.executemany(
+        """
+        INSERT INTO vehicles (
+            stock_code,
+            country_id,
+            year,
+            mileage_km,
+            make,
+            model,
+            color,
+            description,
+            body_type_id,
+            transmission_type_id,
+            fuel_type_id,
+            drivetrain_id,
+            number_of_doors,
+            engine,
+            price_usd,
+            is_available
+        ) VALUES (
+            :stock_code,
+            :country_id,
+            :year,
+            :mileage_km,
+            :make,
+            :model,
+            :color,
+            :description,
+            :body_type_id,
+            :transmission_type_id,
+            :fuel_type_id,
+            :drivetrain_id,
+            :number_of_doors,
+            :engine,
+            :price_usd,
+            :is_available
+        );
+        """,
+        payload,
+    )
+
+
 def initialize_database(db_path: Path = DEFAULT_DB_PATH, seed_count: int = 60) -> dict[str, int]:
     """Create schema and load seed data into SQLite."""
 
@@ -122,47 +242,8 @@ def initialize_database(db_path: Path = DEFAULT_DB_PATH, seed_count: int = 60) -
     with sqlite3.connect(db_path) as conn:
         conn.execute("PRAGMA foreign_keys = ON;")
         conn.executescript(schema_sql)
-
-        conn.executemany(
-            """
-            INSERT INTO vehicles (
-                stock_code,
-                country_of_origin,
-                year,
-                mileage_km,
-                make,
-                model,
-                color,
-                description,
-                body_type,
-                transmission_type,
-                fuel_type,
-                drivetrain,
-                number_of_doors,
-                engine,
-                price_usd,
-                is_available
-            ) VALUES (
-                :stock_code,
-                :country_of_origin,
-                :year,
-                :mileage_km,
-                :make,
-                :model,
-                :color,
-                :description,
-                :body_type,
-                :transmission_type,
-                :fuel_type,
-                :drivetrain,
-                :number_of_doors,
-                :engine,
-                :price_usd,
-                :is_available
-            );
-            """,
-            vehicles,
-        )
+        seed_reference_data(conn)
+        insert_vehicles(conn, vehicles)
 
         vehicle_count = conn.execute("SELECT COUNT(*) FROM vehicles;").fetchone()[0]
         distinct_vehicle_count = conn.execute("SELECT COUNT(DISTINCT stock_code) FROM vehicles;").fetchone()[0]
@@ -200,4 +281,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

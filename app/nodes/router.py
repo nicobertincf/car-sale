@@ -1,13 +1,21 @@
 from app.state import AgentState
+from langchain_core.messages import BaseMessage
 
 
 RESEARCH_KEYWORDS = ("invest", "buscar", "research", "document")
 SUPERVISOR_KEYWORDS = ("revisa", "valida", "audita", "corrige")
 
 
+def _latest_user_text(messages: list[BaseMessage]) -> str:
+    for message in reversed(messages):
+        if message.type == "human":
+            return str(message.content).lower()
+    return ""
+
+
 def router_node(state: AgentState) -> AgentState:
     messages = state.get("messages", [])
-    last_input = messages[-1].lower() if messages else ""
+    last_input = _latest_user_text(messages)
 
     if any(keyword in last_input for keyword in RESEARCH_KEYWORDS):
         next_agent = "researcher"

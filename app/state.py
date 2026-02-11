@@ -1,14 +1,14 @@
 import operator
 from typing import Annotated, Literal
-from typing_extensions import TypedDict
+from typing_extensions import NotRequired
+from langgraph.graph import MessagesState
 
 
-class AgentState(TypedDict, total=False):
+class AgentState(MessagesState):
     """Estado compartido entre nodos del grafo."""
 
-    messages: list[str]
-    intent: str
-    research_context: Annotated[list[str], operator.add]
-    draft_answer: str
-    final_answer: str
-    next_agent: Literal["researcher", "builder", "supervisor", "end"]
+    intent: NotRequired[str]
+    research_context: NotRequired[Annotated[list[str], operator.add]]
+    draft_answer: NotRequired[str]
+    final_answer: NotRequired[str]
+    next_agent: NotRequired[Literal["researcher", "builder", "supervisor", "end"]]

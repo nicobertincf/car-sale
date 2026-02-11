@@ -30,6 +30,7 @@ pip-wheel-metadata/
 
 # Local databases
 *.db
+*.db.bak-pre-migration
 *.sqlite
 *.sqlite3
 

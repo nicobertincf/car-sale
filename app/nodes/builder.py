@@ -1,9 +1,17 @@
 from app.state import AgentState
+from langchain_core.messages import BaseMessage
+
+
+def _latest_user_text(messages: list[BaseMessage]) -> str:
+    for message in reversed(messages):
+        if message.type == "human":
+            return str(message.content)
+    return ""
 
 
 def builder_node(state: AgentState) -> AgentState:
     context = "\n".join(state.get("research_context", []))
-    user_request = state.get("messages", [""])[-1]
+    user_request = _latest_user_text(state.get("messages", []))
 
     if context:
         draft = (

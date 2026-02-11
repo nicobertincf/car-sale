@@ -1,7 +1,7 @@
 {
   "dockerfile_lines": [],
   "graphs": {
-    "multiagente": "./app/graph.py:graph"
+    "car_sales_assistant": "./app/car_sales_graph.py:graph"
   },
   "env": "./.env",
   "python_version": "3.11",
