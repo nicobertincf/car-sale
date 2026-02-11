@@ -68,6 +68,7 @@ CREATE TABLE contact_requests (
     preferred_call_time TEXT NOT NULL,
     notes TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (vehicle_id, customer_name, phone_number, preferred_call_time),
     FOREIGN KEY (vehicle_id) REFERENCES vehicles (id) ON DELETE CASCADE
 );
 

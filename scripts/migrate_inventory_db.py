@@ -145,29 +145,33 @@ def _migrate_contact_requests(source_conn: sqlite3.Connection, target_conn: sqli
     inserted = 0
     for row in rows:
         row_data = dict(row)
-        target_conn.execute(
-            """
-            INSERT INTO contact_requests (
-                id,
-                vehicle_id,
-                customer_name,
-                phone_number,
-                preferred_call_time,
-                notes,
-                created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?);
-            """,
-            (
-                row_data["id"],
-                row_data["vehicle_id"],
-                row_data["customer_name"],
-                row_data["phone_number"],
-                row_data["preferred_call_time"],
-                row_data.get("notes"),
-                row_data.get("created_at"),
-            ),
-        )
-        inserted += 1
+        try:
+            target_conn.execute(
+                """
+                INSERT INTO contact_requests (
+                    id,
+                    vehicle_id,
+                    customer_name,
+                    phone_number,
+                    preferred_call_time,
+                    notes,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    row_data["id"],
+                    row_data["vehicle_id"],
+                    row_data["customer_name"],
+                    row_data["phone_number"],
+                    row_data["preferred_call_time"],
+                    row_data.get("notes"),
+                    row_data.get("created_at"),
+                ),
+            )
+            inserted += 1
+        except sqlite3.IntegrityError:
+            # Skip duplicated rows that violate the normalized unique constraint.
+            continue
 
     return inserted
 

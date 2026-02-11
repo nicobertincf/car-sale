@@ -212,24 +212,59 @@ def create_contact_request(
     preferred_call_time: str,
     notes: str | None = None,
     db_path: Path = DEFAULT_INVENTORY_DB,
-) -> int:
+) -> tuple[int, bool]:
     with sqlite3.connect(db_path) as conn:
         conn.execute("PRAGMA foreign_keys = ON;")
-        cursor = conn.execute(
+        existing_row = conn.execute(
             """
-            INSERT INTO contact_requests (
-                vehicle_id,
-                customer_name,
-                phone_number,
-                preferred_call_time,
-                notes
-            ) VALUES (?, ?, ?, ?, ?);
+            SELECT id
+            FROM contact_requests
+            WHERE vehicle_id = ?
+              AND customer_name = ?
+              AND phone_number = ?
+              AND preferred_call_time = ?
+            ORDER BY id DESC
+            LIMIT 1;
             """,
-            (vehicle_id, customer_name, phone_number, preferred_call_time, notes),
-        )
+            (vehicle_id, customer_name, phone_number, preferred_call_time),
+        ).fetchone()
+        if existing_row:
+            return int(existing_row[0]), False
+
+        try:
+            cursor = conn.execute(
+                """
+                INSERT INTO contact_requests (
+                    vehicle_id,
+                    customer_name,
+                    phone_number,
+                    preferred_call_time,
+                    notes
+                ) VALUES (?, ?, ?, ?, ?);
+                """,
+                (vehicle_id, customer_name, phone_number, preferred_call_time, notes),
+            )
+            conn.commit()
+            return int(cursor.lastrowid), True
+        except sqlite3.IntegrityError:
+            dedup_row = conn.execute(
+                """
+                SELECT id
+                FROM contact_requests
+                WHERE vehicle_id = ?
+                  AND customer_name = ?
+                  AND phone_number = ?
+                  AND preferred_call_time = ?
+                ORDER BY id DESC
+                LIMIT 1;
+                """,
+                (vehicle_id, customer_name, phone_number, preferred_call_time),
+            ).fetchone()
+            if not dedup_row:
+                raise
         conn.commit()
 
-    return int(cursor.lastrowid)
+    return int(dedup_row[0]), False
 
 
 def _load_dimension(conn: sqlite3.Connection, table: str) -> list[dict[str, Any]]:

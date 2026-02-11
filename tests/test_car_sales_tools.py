@@ -65,6 +65,22 @@ def test_tools_can_search_and_create_contact_request(tmp_path):
     )
     assert request_result["ok"] is True
     assert request_result["vehicle_id"] == vehicle_id
+    assert request_result["created"] is True
+
+    duplicate_result = json.loads(
+        create_executive_call_request.invoke(
+            {
+                "vehicle_id": vehicle_id,
+                "customer_name": "Carla Diaz",
+                "phone_number": "+5491111122233",
+                "preferred_call_time": "Mañana 11:30",
+                "notes": "Interesada en financiación",
+            }
+        )
+    )
+    assert duplicate_result["ok"] is True
+    assert duplicate_result["created"] is False
+    assert duplicate_result["request_id"] == request_result["request_id"]
 
 
 def test_tools_auto_migrate_legacy_inventory_db(tmp_path):

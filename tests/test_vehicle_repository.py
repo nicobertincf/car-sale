@@ -53,7 +53,7 @@ def test_search_vehicles_and_create_contact_request(tmp_path):
     assert vehicle is not None
     assert vehicle["id"] == vehicle_id
 
-    request_id = create_contact_request(
+    request_id, created = create_contact_request(
         vehicle_id=vehicle_id,
         customer_name="Ana Perez",
         phone_number="+541112345678",
@@ -61,6 +61,7 @@ def test_search_vehicles_and_create_contact_request(tmp_path):
         notes="Interesada en prueba de manejo.",
         db_path=db_path,
     )
+    assert created is True
 
     with sqlite3.connect(db_path) as conn:
         row = conn.execute(
@@ -75,6 +76,17 @@ def test_search_vehicles_and_create_contact_request(tmp_path):
     assert row is not None
     assert row[1] == vehicle_id
     assert row[2] == "Ana Perez"
+
+    duplicate_request_id, duplicate_created = create_contact_request(
+        vehicle_id=vehicle_id,
+        customer_name="Ana Perez",
+        phone_number="+541112345678",
+        preferred_call_time="Mañana 10:00",
+        notes="Interesada en prueba de manejo.",
+        db_path=db_path,
+    )
+    assert duplicate_created is False
+    assert duplicate_request_id == request_id
 
 
 def test_search_vehicles_by_catalog_ids_and_metadata(tmp_path):

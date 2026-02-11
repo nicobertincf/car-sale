@@ -104,7 +104,9 @@ Capacidades:
 - La IA construye consultas usando solo parámetros permitidos a través de `tools`.
 - SQL final siempre parametrizado y seguro (sin SQL raw del usuario).
 - Registro de solicitud de llamada en `contact_requests`.
+- Solicitud de llamada idempotente (si llega el mismo payload, reutiliza el `request_id` existente).
 - Flujo Tool-Calling con `ToolNode` (estilo módulos del curso).
+- Guardrails de ejecución: trimming de contexto, timeout de modelo y límite de iteraciones de tool-calling.
 
 ### Parametros soportados para cotizar
 
@@ -151,6 +153,9 @@ Base de persistencia de conversaciones:
 Variables opcionales:
 - `DEALERSHIP_DB_PATH` (default `data/dealership.db`)
 - `SHOW_SQL_DEBUG=true` para mostrar SQL generado por la IA en cada respuesta
+- `MAX_CONTEXT_MESSAGES` (default `18`) para ventana deslizante de mensajes enviados al modelo
+- `MAX_AGENT_TOOL_ITERATIONS` (default `8`) para cortar loops de tools
+- `OPENAI_TIMEOUT_SECONDS` (default `45`) timeout por llamada al modelo
 
 ### Ejemplo de flujo
 
@@ -180,6 +185,7 @@ Si no ves chat habilitado:
 source .venv/bin/activate
 pip install -r requirements-dev.txt
 ```
+- para observabilidad de tools, revisa logs estructurados con `tool_name`, `args`, `duration_ms`, `status` y `artifacts`.
 
 ## API keys
 

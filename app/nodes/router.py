@@ -1,27 +1,51 @@
+from __future__ import annotations
+
+import os
+from typing import Literal
+
+from langchain_core.messages import SystemMessage
+from langchain_openai import ChatOpenAI
+from pydantic import BaseModel
+
 from app.state import AgentState
-from langchain_core.messages import BaseMessage
 
 
-RESEARCH_KEYWORDS = ("invest", "buscar", "research", "document")
-SUPERVISOR_KEYWORDS = ("revisa", "valida", "audita", "corrige")
+ROUTER_PROMPT = """
+Eres un router para un flujo multiagente técnico.
+
+Devuelve exactamente una ruta:
+- researcher: cuando el usuario pide investigar, recopilar evidencia o buscar información.
+- builder: cuando el usuario pide diseñar o construir una solución.
+- supervisor: cuando el usuario pide auditar, validar o revisar una propuesta existente.
+
+Si la intención no es clara, devuelve builder.
+""".strip()
 
 
-def _latest_user_text(messages: list[BaseMessage]) -> str:
-    for message in reversed(messages):
-        if message.type == "human":
-            return str(message.content).lower()
-    return ""
+class RouterDecision(BaseModel):
+    next_agent: Literal["researcher", "builder", "supervisor"]
+
+
+def _llm() -> ChatOpenAI:
+    return ChatOpenAI(
+        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        temperature=0,
+        timeout=float(os.getenv("OPENAI_TIMEOUT_SECONDS", "45")),
+    )
 
 
 def router_node(state: AgentState) -> AgentState:
     messages = state.get("messages", [])
-    last_input = _latest_user_text(messages)
 
-    if any(keyword in last_input for keyword in RESEARCH_KEYWORDS):
-        next_agent = "researcher"
-    elif any(keyword in last_input for keyword in SUPERVISOR_KEYWORDS):
-        next_agent = "supervisor"
-    else:
+    if not os.getenv("OPENAI_API_KEY"):
+        return {"intent": "builder", "next_agent": "builder"}
+
+    try:
+        decision = _llm().with_structured_output(RouterDecision).invoke(
+            [SystemMessage(content=ROUTER_PROMPT)] + messages
+        )
+        next_agent = decision.next_agent
+    except Exception:
         next_agent = "builder"
 
     return {

@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from typing import Any, Literal
 
-from langchain_core.messages import AIMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, trim_messages
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
@@ -20,6 +20,8 @@ from app.tools.car_sales_tools import CONTACT_TOOLS, QUOTE_TOOLS
 
 class CarSalesState(MessagesState):
     route: NotRequired[Literal["quote_agent", "contact_agent"]]
+    quote_agent_turns: NotRequired[int]
+    contact_agent_turns: NotRequired[int]
 
 
 class RouteDecision(BaseModel):
@@ -40,11 +42,32 @@ def _ensure_langchain_cache_compat() -> None:
 
 def _llm() -> ChatOpenAI:
     _ensure_langchain_cache_compat()
-    return ChatOpenAI(model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"), temperature=0)
+    timeout_seconds = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "45"))
+    return ChatOpenAI(
+        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        temperature=0,
+        timeout=timeout_seconds,
+    )
+
+
+def _max_agent_tool_iterations() -> int:
+    return max(1, int(os.getenv("MAX_AGENT_TOOL_ITERATIONS", "8")))
+
+
+def _trim_history(messages: list[BaseMessage]) -> list[BaseMessage]:
+    max_messages = max(4, int(os.getenv("MAX_CONTEXT_MESSAGES", "18")))
+    trimmer = trim_messages(
+        strategy="last",
+        max_tokens=max_messages,
+        token_counter=len,
+        start_on="human",
+        include_system=False,
+    )
+    return trimmer.invoke(messages)
 
 
 def router_node(state: CarSalesState) -> CarSalesState:
-    messages = state["messages"]
+    messages = _trim_history(state["messages"])
     previous_route = state.get("route", "quote_agent")
 
     if not os.getenv("OPENAI_API_KEY"):
@@ -65,7 +88,21 @@ def route_from_router(state: CarSalesState) -> str:
 
 
 def quote_agent_node(state: CarSalesState) -> CarSalesState:
-    messages = state["messages"]
+    messages = _trim_history(state["messages"])
+    turns = int(state.get("quote_agent_turns", 0)) + 1
+    if turns > _max_agent_tool_iterations():
+        return {
+            "messages": [
+                AIMessage(
+                    content=(
+                        "Detuve la ejecución para evitar un bucle de herramientas. "
+                        "¿Quieres que reintente con filtros más claros?"
+                    )
+                )
+            ],
+            "route": "quote_agent",
+            "quote_agent_turns": turns,
+        }
 
     if not os.getenv("OPENAI_API_KEY"):
         return {
@@ -82,11 +119,29 @@ def quote_agent_node(state: CarSalesState) -> CarSalesState:
     response = _llm().bind_tools(QUOTE_TOOLS).invoke(
         [SystemMessage(content=QUOTE_AGENT_SYSTEM_PROMPT)] + messages
     )
-    return {"messages": [response], "route": "quote_agent"}
+    return {
+        "messages": [response],
+        "route": "quote_agent",
+        "quote_agent_turns": turns,
+    }
 
 
 def contact_agent_node(state: CarSalesState) -> CarSalesState:
-    messages = state["messages"]
+    messages = _trim_history(state["messages"])
+    turns = int(state.get("contact_agent_turns", 0)) + 1
+    if turns > _max_agent_tool_iterations():
+        return {
+            "messages": [
+                AIMessage(
+                    content=(
+                        "Detuve la ejecución para evitar un bucle de herramientas. "
+                        "Confirmemos los datos de contacto y el ID del vehículo."
+                    )
+                )
+            ],
+            "route": "contact_agent",
+            "contact_agent_turns": turns,
+        }
 
     if not os.getenv("OPENAI_API_KEY"):
         return {
@@ -103,7 +158,11 @@ def contact_agent_node(state: CarSalesState) -> CarSalesState:
     response = _llm().bind_tools(CONTACT_TOOLS).invoke(
         [SystemMessage(content=CONTACT_AGENT_SYSTEM_PROMPT)] + messages
     )
-    return {"messages": [response], "route": "contact_agent"}
+    return {
+        "messages": [response],
+        "route": "contact_agent",
+        "contact_agent_turns": turns,
+    }
 
 
 def _route_after_agent(state: CarSalesState, tools_node_name: str) -> str:
