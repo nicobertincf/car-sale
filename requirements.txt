@@ -1,0 +1,9 @@
+langgraph
+langgraph-prebuilt
+langchain-core
+langchain-openai
+langchain-community
+langsmith
+langchain-tavily
+trustcall
+python-dotenv
