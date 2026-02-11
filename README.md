@@ -20,6 +20,53 @@ pytest -q
 langgraph dev
 ```
 
+## SQLite inventory
+
+Se agrego una base SQLite para una automotora de usados con:
+- tabla `vehicles` (inventario de autos),
+- tabla `contact_requests` (solicitudes de contacto por vehiculo).
+
+### Esquema
+
+Archivo SQL:
+`app/db/schema.sql`
+
+Campos principales de `vehicles`:
+- `country_of_origin`
+- `year`
+- `mileage_km`
+- `make`
+- `model`
+- `color`
+- `description`
+- `body_type`
+- `transmission_type`
+- `fuel_type`
+- `drivetrain`
+- `number_of_doors`
+
+Campos de `contact_requests`:
+- `customer_name`
+- `phone_number`
+- `preferred_call_time`
+- `vehicle_id` (FK a `vehicles.id`)
+
+### Inicializar DB + seed (60 autos distintos)
+
+```bash
+cd pruebas/proyecto_multiagentes
+python3 scripts/init_sqlite_db.py
+```
+
+DB generada por defecto:
+`data/dealership.db`
+
+Opcional (path o cantidad personalizada, minimo 50):
+
+```bash
+python3 scripts/init_sqlite_db.py --db-path data/mi_inventario.db --seed-count 75
+```
+
 ## API keys
 
 Variables recomendadas:
@@ -71,7 +118,7 @@ Si tu cuenta esta en region EU, agrega tambien:
 LANGSMITH_ENDPOINT="https://eu.api.smith.langchain.com"
 ```
 
-### 4) Cargar variables (mismo patron del module-0)
+### 4) Cargar variables
 
 El notebook usa un helper para pedir la variable si no existe:
 

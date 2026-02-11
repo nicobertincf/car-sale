@@ -28,6 +28,11 @@ dist/
 .eggs/
 pip-wheel-metadata/
 
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
 # Jupyter
 .ipynb_checkpoints/
 
