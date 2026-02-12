@@ -107,6 +107,19 @@ Capacidades:
 - Solicitud de llamada idempotente (si llega el mismo payload, reutiliza el `request_id` existente).
 - Flujo Tool-Calling con `ToolNode` (estilo módulos del curso).
 - Guardrails de ejecución: trimming de contexto, timeout de modelo y límite de iteraciones de tool-calling.
+- Nodo final de supervisión de respuesta al cliente:
+  - reescribe la salida para tono conversacional en párrafos,
+  - elimina exposición de IDs internos (`ID`, `request_id`, `vehicle_id`, etc.),
+  - evita formato tipo lista numerada/viñetas o bloques tipo payload.
+- Estado conversacional persistente con `MessagesState` + reducers:
+  - `conversation_language`
+  - `active_search_filters`
+  - `last_vehicle_candidates`
+  - `known_contact_profile`
+  - `search_history` / `contact_history`
+  - `state_logs`
+  Esto evita perder datos relevantes cuando el contexto al LLM se recorta con `trim_messages`.
+  El idioma se infiere por LLM y se guarda en `conversation_language` para mantener consistencia de respuesta por hilo.
 
 ### Parametros soportados para cotizar
 
@@ -155,6 +168,9 @@ Variables opcionales:
 - `SHOW_SQL_DEBUG=true` para mostrar SQL generado por la IA en cada respuesta
 - `MAX_CONTEXT_MESSAGES` (default `18`) para ventana deslizante de mensajes enviados al modelo
 - `MAX_AGENT_TOOL_ITERATIONS` (default `8`) para cortar loops de tools
+- `MAX_QUOTE_ITERATIONS_PER_TURN` (default `3`) para evitar búsquedas especulativas en cadena en un mismo turno
+- `MAX_CONTACT_ITERATIONS_PER_TURN` (default `3`) para evitar loops en captura/confirmación de contacto
+- `DEFAULT_CONVERSATION_LANGUAGE` fallback solo si no hay inferencia disponible (default `es`)
 - `OPENAI_TIMEOUT_SECONDS` (default `45`) timeout por llamada al modelo
 
 ### Ejemplo de flujo
