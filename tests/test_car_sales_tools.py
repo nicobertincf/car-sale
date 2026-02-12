@@ -11,11 +11,12 @@ from app.tools.car_sales_tools import (
 from scripts.init_sqlite_db import initialize_database
 
 
-def test_tools_can_search_and_create_contact_request(tmp_path):
+def test_tools_can_search_and_create_contact_request(tmp_path, monkeypatch):
     db_path = tmp_path / "dealer.db"
     initialize_database(db_path=db_path, seed_count=60)
 
     os.environ["DEALERSHIP_DB_PATH"] = str(db_path)
+    monkeypatch.setenv("CONTACT_DEDUP_WINDOW_MINUTES", "30")
 
     filter_info = json.loads(list_available_vehicle_filters.invoke({}))
     assert "allowed_filters" in filter_info
@@ -148,3 +149,71 @@ def test_tools_auto_migrate_legacy_inventory_db(tmp_path):
     results = json.loads(search_used_vehicles.invoke({"country_id": japan["id"], "limit": 5}))
     assert results["count"] == 1
     assert results["vehicles"][0]["country_of_origin"] == "Japan"
+
+
+def test_tools_migrate_contact_unique_constraint(tmp_path, monkeypatch):
+    db_path = tmp_path / "contact_unique.db"
+    initialize_database(db_path=db_path, seed_count=60)
+
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            PRAGMA foreign_keys = OFF;
+            BEGIN;
+            CREATE TABLE contact_requests_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                vehicle_id INTEGER NOT NULL,
+                customer_name TEXT NOT NULL,
+                phone_number TEXT NOT NULL,
+                preferred_call_time TEXT NOT NULL,
+                notes TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (vehicle_id, customer_name, phone_number, preferred_call_time),
+                FOREIGN KEY (vehicle_id) REFERENCES vehicles (id) ON DELETE CASCADE
+            );
+            INSERT INTO contact_requests_new (
+                id, vehicle_id, customer_name, phone_number, preferred_call_time, notes, created_at
+            )
+            SELECT id, vehicle_id, customer_name, phone_number, preferred_call_time, notes, created_at
+            FROM contact_requests;
+            DROP TABLE contact_requests;
+            ALTER TABLE contact_requests_new RENAME TO contact_requests;
+            COMMIT;
+            PRAGMA foreign_keys = ON;
+            """
+        )
+
+    monkeypatch.setenv("DEALERSHIP_DB_PATH", str(db_path))
+    monkeypatch.setenv("CONTACT_DEDUP_WINDOW_MINUTES", "0")
+
+    _ = json.loads(list_available_vehicle_filters.invoke({}))
+
+    with sqlite3.connect(db_path) as conn:
+        index_list = conn.execute("PRAGMA index_list(contact_requests);").fetchall()
+        unique_indexes = [row for row in index_list if int(row[2]) == 1]
+    assert not unique_indexes
+
+    search_result = json.loads(search_used_vehicles.invoke({"make": "Audi", "limit": 1}))
+    vehicle_id = int(search_result["vehicles"][0]["id"])
+    first = json.loads(
+        create_executive_call_request.invoke(
+            {
+                "vehicle_id": vehicle_id,
+                "customer_name": "Nicolas Bertin",
+                "phone_number": "+56967297181",
+                "preferred_call_time": "tarde",
+            }
+        )
+    )
+    second = json.loads(
+        create_executive_call_request.invoke(
+            {
+                "vehicle_id": vehicle_id,
+                "customer_name": "Nicolas Bertin",
+                "phone_number": "+56967297181",
+                "preferred_call_time": "tarde",
+            }
+        )
+    )
+    assert first["created"] is True
+    assert second["created"] is True

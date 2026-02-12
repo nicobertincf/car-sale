@@ -142,10 +142,8 @@ Prompts:
 
 Tools:
 - `app/tools/car_sales_tools.py`
-  - `list_available_vehicle_filters`
-  - `search_used_vehicles`
-  - `get_vehicle_details`
-  - `create_executive_call_request`
+  - Flujo cotización: `list_available_vehicle_filters`, `search_used_vehicles`
+  - Flujo contacto: `get_vehicle_details`, `create_executive_call_request`
 
 Nota:
 - `list_available_vehicle_filters` consulta catálogos reales en DB y entrega `id + name`.
@@ -170,7 +168,9 @@ Variables opcionales:
 - `MAX_AGENT_TOOL_ITERATIONS` (default `8`) para cortar loops de tools
 - `MAX_QUOTE_ITERATIONS_PER_TURN` (default `3`) para evitar búsquedas especulativas en cadena en un mismo turno
 - `MAX_CONTACT_ITERATIONS_PER_TURN` (default `3`) para evitar loops en captura/confirmación de contacto
+- `CONTACT_DEDUP_WINDOW_MINUTES` (default `0`) ventana para deduplicar solicitudes idénticas de contacto (mismo vehículo + nombre + teléfono + horario). Si `0`, no deduplica.
 - `DEFAULT_CONVERSATION_LANGUAGE` fallback solo si no hay inferencia disponible (default `es`)
+- `FINAL_SUPERVISOR_USE_LLM` (default `true`): si `true`, aplica supervisión final con LLM para limpiar formato y lenguaje customer-facing; si `false`, deja el borrador del agente.
 - `OPENAI_TIMEOUT_SECONDS` (default `45`) timeout por llamada al modelo
 
 ### Ejemplo de flujo

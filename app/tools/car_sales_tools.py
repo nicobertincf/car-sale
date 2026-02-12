@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import sqlite3
 import time
 from pathlib import Path
@@ -40,6 +39,102 @@ def _column_names(conn: sqlite3.Connection, table_name: str) -> set[str]:
     return {row[1] for row in conn.execute(f"PRAGMA table_info({table_name});").fetchall()}
 
 
+def _has_legacy_contact_unique_constraint(conn: sqlite3.Connection) -> bool:
+    if not _table_exists(conn, "contact_requests"):
+        return False
+
+    for row in conn.execute("PRAGMA index_list(contact_requests);").fetchall():
+        # PRAGMA index_list columns: seq, name, unique, origin, partial
+        if len(row) < 3 or int(row[2]) != 1:
+            continue
+        index_name = row[1]
+        columns = [index_row[2] for index_row in conn.execute(f"PRAGMA index_info({index_name});").fetchall()]
+        if columns == ["vehicle_id", "customer_name", "phone_number", "preferred_call_time"]:
+            return True
+    return False
+
+
+def _migrate_contact_requests_remove_unique(db_path: Path) -> None:
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA foreign_keys = OFF;")
+        try:
+            conn.execute("BEGIN;")
+            conn.executescript(
+                """
+                CREATE TABLE contact_requests_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    vehicle_id INTEGER NOT NULL,
+                    customer_name TEXT NOT NULL,
+                    phone_number TEXT NOT NULL,
+                    preferred_call_time TEXT NOT NULL,
+                    notes TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (vehicle_id) REFERENCES vehicles (id) ON DELETE CASCADE
+                );
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO contact_requests_new (
+                    id,
+                    vehicle_id,
+                    customer_name,
+                    phone_number,
+                    preferred_call_time,
+                    notes,
+                    created_at
+                )
+                SELECT
+                    id,
+                    vehicle_id,
+                    customer_name,
+                    phone_number,
+                    preferred_call_time,
+                    notes,
+                    created_at
+                FROM contact_requests
+                ORDER BY id ASC;
+                """
+            )
+            conn.executescript(
+                """
+                DROP TABLE contact_requests;
+                ALTER TABLE contact_requests_new RENAME TO contact_requests;
+                CREATE INDEX IF NOT EXISTS idx_contact_requests_vehicle_id ON contact_requests (vehicle_id);
+                CREATE INDEX IF NOT EXISTS idx_contact_requests_dedup ON contact_requests (
+                    vehicle_id,
+                    customer_name,
+                    phone_number,
+                    preferred_call_time,
+                    created_at
+                );
+                """
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.execute("PRAGMA foreign_keys = ON;")
+
+
+def _ensure_contact_request_indexes(db_path: Path) -> None:
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_contact_requests_vehicle_id ON contact_requests (vehicle_id);
+            CREATE INDEX IF NOT EXISTS idx_contact_requests_dedup ON contact_requests (
+                vehicle_id,
+                customer_name,
+                phone_number,
+                preferred_call_time,
+                created_at
+            );
+            """
+        )
+        conn.commit()
+
+
 def _ensure_inventory_schema(db_path: Path) -> None:
     path_key = str(db_path.resolve())
     if path_key in _SCHEMA_READY_PATHS:
@@ -60,14 +155,26 @@ def _ensure_inventory_schema(db_path: Path) -> None:
         _SCHEMA_READY_PATHS.add(path_key)
         return
 
+    has_modern_vehicle_schema = False
+    needs_contact_migration = False
+
     with sqlite3.connect(db_path) as conn:
         has_countries = _table_exists(conn, "countries")
         has_vehicles = _table_exists(conn, "vehicles")
-        if has_countries and has_vehicles and "country_id" in _column_names(conn, "vehicles"):
+        has_modern_vehicle_schema = has_countries and has_vehicles and "country_id" in _column_names(conn, "vehicles")
+        needs_contact_migration = has_modern_vehicle_schema and _has_legacy_contact_unique_constraint(conn)
+        if has_modern_vehicle_schema and not needs_contact_migration:
+            _ensure_contact_request_indexes(db_path)
             _SCHEMA_READY_PATHS.add(path_key)
             return
 
         is_legacy = has_vehicles and "country_of_origin" in _column_names(conn, "vehicles")
+
+    if has_modern_vehicle_schema and needs_contact_migration:
+        _migrate_contact_requests_remove_unique(db_path)
+        _ensure_contact_request_indexes(db_path)
+        _SCHEMA_READY_PATHS.add(path_key)
+        return
 
     if is_legacy:
         try:
@@ -96,7 +203,7 @@ def _json(data: Any) -> str:
 
 
 def _mask_phone(phone_number: str) -> str:
-    digits = re.sub(r"\D", "", phone_number)
+    digits = "".join(char for char in phone_number if char.isdigit())
     if len(digits) <= 4:
         return "***"
     return f"{'*' * (len(digits) - 4)}{digits[-4:]}"
@@ -406,8 +513,9 @@ def create_executive_call_request(
         )
         return _json({"ok": False, "error": f"Vehicle ID {vehicle_id} is not available."})
 
-    normalized_phone = re.sub(r"[^\d+]", "", phone_number)
-    if len(re.sub(r"\D", "", normalized_phone)) < 8:
+    normalized_phone = "".join(char for char in phone_number if char.isdigit() or char == "+")
+    digit_count = sum(1 for char in normalized_phone if char.isdigit())
+    if digit_count < 8:
         duration_ms = int((time.perf_counter() - started_at) * 1000)
         _log_tool_event(
             "create_executive_call_request",
@@ -476,7 +584,6 @@ def create_executive_call_request(
 QUOTE_TOOLS = [
     list_available_vehicle_filters,
     search_used_vehicles,
-    get_vehicle_details,
 ]
 
 CONTACT_TOOLS = [

@@ -68,7 +68,6 @@ CREATE TABLE contact_requests (
     preferred_call_time TEXT NOT NULL,
     notes TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (vehicle_id, customer_name, phone_number, preferred_call_time),
     FOREIGN KEY (vehicle_id) REFERENCES vehicles (id) ON DELETE CASCADE
 );
 
@@ -78,3 +77,10 @@ CREATE INDEX idx_vehicles_country_id ON vehicles (country_id);
 CREATE INDEX idx_vehicles_body_type_id ON vehicles (body_type_id);
 CREATE INDEX idx_vehicles_fuel_type_id ON vehicles (fuel_type_id);
 CREATE INDEX idx_contact_requests_vehicle_id ON contact_requests (vehicle_id);
+CREATE INDEX idx_contact_requests_dedup ON contact_requests (
+    vehicle_id,
+    customer_name,
+    phone_number,
+    preferred_call_time,
+    created_at
+);

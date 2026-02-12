@@ -1,5 +1,4 @@
 import sqlite3
-
 from app.db.vehicle_repository import (
     build_vehicle_search_query,
     create_contact_request,
@@ -33,7 +32,8 @@ def test_build_vehicle_query_uses_allowed_parameterized_filters():
     assert params["mileage_km_max"] == 90000
 
 
-def test_search_vehicles_and_create_contact_request(tmp_path):
+def test_search_vehicles_and_create_contact_request(tmp_path, monkeypatch):
+    monkeypatch.setenv("CONTACT_DEDUP_WINDOW_MINUTES", "30")
     db_path = tmp_path / "dealer.db"
     initialize_database(db_path=db_path, seed_count=60)
 
@@ -87,6 +87,36 @@ def test_search_vehicles_and_create_contact_request(tmp_path):
     )
     assert duplicate_created is False
     assert duplicate_request_id == request_id
+
+
+def test_create_contact_request_allows_new_row_when_dedup_window_disabled(tmp_path, monkeypatch):
+    db_path = tmp_path / "dealer_no_dedup.db"
+    initialize_database(db_path=db_path, seed_count=60)
+    monkeypatch.setenv("CONTACT_DEDUP_WINDOW_MINUTES", "0")
+
+    results, _, _ = search_vehicles({"make": "Audi", "limit": 1}, db_path=db_path)
+    vehicle_id = int(results[0]["id"])
+
+    first_id, first_created = create_contact_request(
+        vehicle_id=vehicle_id,
+        customer_name="Nicolas Bertin",
+        phone_number="+56967297181",
+        preferred_call_time="tarde",
+        notes=None,
+        db_path=db_path,
+    )
+    second_id, second_created = create_contact_request(
+        vehicle_id=vehicle_id,
+        customer_name="Nicolas Bertin",
+        phone_number="+56967297181",
+        preferred_call_time="tarde",
+        notes=None,
+        db_path=db_path,
+    )
+
+    assert first_created is True
+    assert second_created is True
+    assert second_id != first_id
 
 
 def test_search_vehicles_by_catalog_ids_and_metadata(tmp_path):

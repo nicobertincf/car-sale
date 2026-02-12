@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
-import unicodedata
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -14,7 +12,11 @@ from langgraph.prebuilt import ToolNode
 from pydantic import BaseModel
 from typing_extensions import NotRequired
 
-from app.db.vehicle_repository import ALLOWED_FILTERS, DEFAULT_INVENTORY_DB, get_inventory_metadata
+from app.db.vehicle_repository import (
+    ALLOWED_FILTERS,
+    DEFAULT_INVENTORY_DB,
+    get_inventory_metadata,
+)
 from app.prompts.car_sales_prompts import (
     CONTACT_AGENT_SYSTEM_PROMPT,
     FINAL_RESPONSE_SYSTEM_PROMPT,
@@ -103,8 +105,10 @@ class CarSalesState(MessagesState):
     search_history: NotRequired[Annotated[list[dict[str, Any]], _append_search_events]]
     contact_history: NotRequired[Annotated[list[dict[str, Any]], _append_contact_events]]
     runtime_country_id_override: NotRequired[int | None]
+    runtime_make_override: NotRequired[str | None]
     runtime_clear_make: NotRequired[bool]
     runtime_country_intent_detected: NotRequired[bool]
+    runtime_parallel_search_mode: NotRequired[bool]
 
 
 class RouteDecision(BaseModel):
@@ -113,8 +117,10 @@ class RouteDecision(BaseModel):
 
 class QuoteRuntimeDirective(BaseModel):
     country_id_override: int | None = None
+    make_override: str | None = None
     clear_make: bool = False
     country_intent_detected: bool = False
+    parallel_search_mode: bool = False
 
 
 class ConversationLanguageDecision(BaseModel):
@@ -184,7 +190,15 @@ def _sanitize_language_code(raw_value: Any) -> str | None:
     code = raw_value.strip().lower().replace("_", "-")
     if not code:
         return None
-    if not re.fullmatch(r"[a-z]{2,3}(?:-[a-z0-9]{2,8})?", code):
+    if len(code) > 16:
+        return None
+    for token in code.split("-"):
+        if not token:
+            return None
+        if not token.isalnum():
+            return None
+    primary = code.split("-")[0]
+    if len(primary) < 2 or len(primary) > 3:
         return None
     return code
 
@@ -468,13 +482,6 @@ def _render_state_context_block(state: CarSalesState) -> str:
     return "\n".join(lines).strip()
 
 
-def _normalize_text(value: str) -> str:
-    normalized = unicodedata.normalize("NFKD", value)
-    normalized = normalized.encode("ascii", "ignore").decode("ascii")
-    normalized = re.sub(r"[^a-zA-Z0-9]+", " ", normalized).strip().lower()
-    return normalized
-
-
 def _extract_last_contact_profile(messages: list[BaseMessage]) -> dict[str, str] | None:
     for message in reversed(messages):
         if getattr(message, "type", None) != "ai":
@@ -547,81 +554,156 @@ def _extract_recent_vehicle_candidates(messages: list[BaseMessage], *, max_items
     return []
 
 
-def _match_vehicle_candidates(latest_user_text: str, candidates: list[dict[str, Any]]) -> list[int]:
-    if not latest_user_text or not candidates:
-        return []
+def _coerce_tool_call_args(raw_args: Any) -> dict[str, Any]:
+    if isinstance(raw_args, dict):
+        return dict(raw_args)
+    if isinstance(raw_args, str):
+        parsed = _safe_json_loads(raw_args)
+        if isinstance(parsed, dict):
+            return dict(parsed)
+    return {}
 
-    normalized_text = f" {_normalize_text(latest_user_text)} "
-    matches: list[int] = []
-    for candidate in candidates:
-        candidate_id = candidate.get("id")
-        if not isinstance(candidate_id, int):
+
+def _has_tool_result_in_current_turn(messages: list[BaseMessage], tool_name: str) -> bool:
+    for message in reversed(messages):
+        message_type = getattr(message, "type", None)
+        if message_type == "human":
+            break
+        if message_type != "tool":
             continue
-        make = _normalize_text(str(candidate.get("make", "")))
-        model = _normalize_text(str(candidate.get("model", "")))
-        if not model:
+        current_name = str(getattr(message, "name", "")).strip()
+        if current_name == tool_name:
+            return True
+    return False
+
+
+def _enforce_quote_tool_call_policy(
+    response: AIMessage,
+    *,
+    active_filters: dict[str, Any],
+    runtime_country_id_override: int | None,
+    runtime_make_override: str | None,
+    runtime_clear_make: bool,
+    runtime_country_intent_detected: bool,
+    runtime_parallel_search_mode: bool,
+    conversation_language: str,
+    catalog_lookup_in_current_turn: bool,
+) -> AIMessage:
+    tool_calls = getattr(response, "tool_calls", None) or []
+    if not tool_calls:
+        return response
+
+    has_search_call = any(
+        isinstance(call, dict) and call.get("name") == "search_used_vehicles"
+        for call in tool_calls
+    )
+    search_call_count = sum(
+        1 for call in tool_calls if isinstance(call, dict) and call.get("name") == "search_used_vehicles"
+    )
+    effective_parallel_mode = runtime_parallel_search_mode or search_call_count > 1
+    if has_search_call and not catalog_lookup_in_current_turn:
+        first_search_call = next(
+            (
+                call
+                for call in tool_calls
+                if isinstance(call, dict) and call.get("name") == "search_used_vehicles"
+            ),
+            None,
+        )
+        base_call_id = str((first_search_call or {}).get("id") or "call_search")
+        return AIMessage(
+            content="",
+            id=getattr(response, "id", None),
+            tool_calls=[
+                {
+                    "id": f"{base_call_id}_catalog",
+                    "name": "list_available_vehicle_filters",
+                    "args": {},
+                    "type": "tool_call",
+                }
+            ],
+        )
+
+    if (
+        runtime_country_intent_detected
+        and runtime_country_id_override is None
+        and not effective_parallel_mode
+    ):
+        if has_search_call:
+            try:
+                metadata = get_inventory_metadata(db_path=_inventory_db_path())
+                countries = metadata.get("countries", [])
+            except Exception:
+                countries = []
+            country_names = [str(item.get("name", "")).strip() for item in countries if str(item.get("name", "")).strip()]
+            options = ", ".join(country_names[:12])
+            in_spanish = str(conversation_language).lower().startswith("es")
+            if in_spanish:
+                content = (
+                    "Para buscar por país/origen necesito que confirmes el país exacto del catálogo."
+                    + (f" Países disponibles: {options}." if options else "")
+                )
+            else:
+                content = (
+                    "To search by country/origin I need you to confirm the exact catalog country."
+                    + (f" Available countries: {options}." if options else "")
+                )
+            return AIMessage(content=content, id=getattr(response, "id", None))
+
+    patched_calls: list[dict[str, Any]] = []
+    seen_search_args: set[str] = set()
+    changed = False
+
+    for call in tool_calls:
+        if not isinstance(call, dict):
+            patched_calls.append(call)
             continue
 
-        model_match = f" {model} " in normalized_text
-        make_match = not make or f" {make} " in normalized_text
-        if model_match and make_match:
-            matches.append(candidate_id)
-
-    deduped_matches: list[int] = []
-    seen: set[int] = set()
-    for candidate_id in matches:
-        if candidate_id in seen:
+        if call.get("name") != "search_used_vehicles":
+            patched_calls.append(call)
             continue
-        seen.add(candidate_id)
-        deduped_matches.append(candidate_id)
-    return deduped_matches
 
+        args = _coerce_tool_call_args(call.get("args"))
+        if effective_parallel_mode:
+            enforced_args = _sanitize_search_filters(args)
+        else:
+            enforced_args = _sanitize_search_filters(active_filters)
+            enforced_args.update(_sanitize_search_filters(args))
 
-_INTERNAL_ID_PATTERNS = [
-    r"\b(?:request|vehicle|country|body_type|fuel_type|transmission_type|drivetrain|tool_call|thread|assistant)_?id\b\s*[:#-]?\s*[a-z0-9-]+\b",
-    r"\b(?:id|ids?)\b\s*[:#-]?\s*\d+\b",
-    r"\b(?:request|vehicle)\s+id\b\s*[:#-]?\s*\d+\b",
-    r"\(\s*(?:id|request_id|vehicle_id|country_id)\s*[:#-]?\s*[a-z0-9-]+\s*\)",
-]
+            if runtime_country_id_override is not None:
+                enforced_args["country_id"] = runtime_country_id_override
+            elif runtime_country_intent_detected:
+                enforced_args.pop("country_id", None)
 
+            if runtime_clear_make:
+                enforced_args.pop("make", None)
+            if isinstance(runtime_make_override, str) and runtime_make_override.strip():
+                enforced_args["make"] = runtime_make_override.strip()
 
-def _strip_internal_identifiers(text: str) -> str:
-    cleaned = text
-    for pattern in _INTERNAL_ID_PATTERNS:
-        cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
+        if "limit" not in enforced_args:
+            enforced_args["limit"] = 5
 
-    cleaned_lines: list[str] = []
-    for line in cleaned.splitlines():
-        stripped = line.strip()
-        if not stripped:
+        dedup_key = json.dumps(enforced_args, sort_keys=True, ensure_ascii=False)
+        if dedup_key in seen_search_args:
+            changed = True
             continue
-        if re.match(r"^(?:id|request[_\s]?id|vehicle[_\s]?id|country[_\s]?id)\b", stripped, flags=re.IGNORECASE):
-            continue
-        cleaned_lines.append(stripped)
-    return "\n".join(cleaned_lines).strip()
+        seen_search_args.add(dedup_key)
 
+        patched_call = dict(call)
+        patched_call["args"] = enforced_args
+        patched_calls.append(patched_call)
 
-def _to_continuous_paragraphs(text: str) -> str:
-    normalized_lines: list[str] = []
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        line = re.sub(r"^[-*•]\s+", "", line)
-        line = re.sub(r"^\d+\.\s+", "", line)
-        if not line:
-            continue
-        normalized_lines.append(line)
+        if enforced_args != args:
+            changed = True
 
-    paragraph = " ".join(normalized_lines)
-    paragraph = re.sub(r"\s+", " ", paragraph).strip()
-    paragraph = re.sub(r"\s+([,.;:!?])", r"\1", paragraph)
-    return paragraph
+    if not changed:
+        return response
 
-
-def _sanitize_final_response_text(text: str) -> str:
-    without_ids = _strip_internal_identifiers(text)
-    return _to_continuous_paragraphs(without_ids)
+    try:
+        return response.model_copy(update={"tool_calls": patched_calls}, deep=True)
+    except Exception:
+        response.tool_calls = patched_calls
+        return response
 
 
 def _infer_quote_runtime_directive(messages: list[BaseMessage]) -> QuoteRuntimeDirective:
@@ -635,28 +717,48 @@ def _infer_quote_runtime_directive(messages: list[BaseMessage]) -> QuoteRuntimeD
     try:
         metadata = get_inventory_metadata(db_path=_inventory_db_path())
         countries = metadata.get("countries", [])
+        makes_raw = metadata.get("makes", [])
         if not countries:
             return QuoteRuntimeDirective()
 
-        valid_country_ids = {int(item["id"]) for item in countries}
-        countries_table = "\n".join(f"- id={item['id']} name={item['name']}" for item in countries)
+        valid_country_ids = {int(item["id"]) for item in countries if item.get("id") is not None}
+        valid_makes_by_key = {
+            str(make).strip().lower(): str(make).strip()
+            for make in makes_raw
+            if isinstance(make, str) and make.strip()
+        }
+        countries_table = "\n".join(
+            f"- id={item['id']} name={item['name']}"
+            for item in countries
+            if item.get("id") is not None and str(item.get("name", "")).strip()
+        )
+        makes_table = "\n".join(f"- {name}" for name in sorted(valid_makes_by_key.values()))
         system_prompt = f"""
 You are an intent parser for vehicle search filters.
 
 Country catalog (use only these IDs):
 {countries_table}
 
+Make catalog (use only these names):
+{makes_table}
+
 Return JSON with:
 - country_id_override: integer or null
+- make_override: string or null
 - clear_make: boolean
 - country_intent_detected: boolean
+- parallel_search_mode: boolean
 
 Rules:
 1. If the LAST user message contains explicit or implicit country/origin/nationality intent
-   (including demonyms), set country_intent_detected=true and assign the correct country_id when possible.
-2. If the user asks for a general country-based search and does not ask for a brand, set clear_make=true.
-3. If there is no explicit country/origin intent, set country_id_override=null and country_intent_detected=false.
-4. Never invent IDs outside the catalog.
+   (including demonyms), set country_intent_detected=true and assign the correct country_id_override when possible.
+2. If the LAST user message explicitly asks for a brand, set make_override to the exact catalog make name.
+3. If the user asks for a general country-based search and does not ask for a brand, set clear_make=true.
+4. If the user explicitly asks for a brand, set clear_make=false.
+5. If there is no explicit country/origin intent, set country_id_override=null and country_intent_detected=false.
+6. Never return IDs outside the catalog and never return make names outside the catalog.
+7. Set parallel_search_mode=true only when the user asks for two or more independent searches in the same message.
+   In parallel_search_mode, set country_id_override=null, make_override=null, clear_make=false, and country_intent_detected=false.
 """.strip()
 
         directive = _llm().with_structured_output(QuoteRuntimeDirective).invoke(
@@ -664,6 +766,16 @@ Rules:
         )
         if directive.country_id_override is not None and directive.country_id_override not in valid_country_ids:
             directive.country_id_override = None
+        if directive.make_override is not None:
+            normalized_key = str(directive.make_override).strip().lower()
+            directive.make_override = valid_makes_by_key.get(normalized_key)
+        if directive.parallel_search_mode:
+            directive.country_id_override = None
+            directive.make_override = None
+            directive.clear_make = False
+            directive.country_intent_detected = False
+        if directive.make_override:
+            directive.clear_make = False
         if directive.country_intent_detected and directive.country_id_override is None:
             directive.clear_make = True
         return directive
@@ -737,20 +849,30 @@ def quote_agent_node(state: CarSalesState) -> CarSalesState:
         turns = 1
         runtime_directive = _infer_quote_runtime_directive(state_ctx["messages"])
         runtime_country_id_override = runtime_directive.country_id_override
+        runtime_make_override = runtime_directive.make_override
         runtime_clear_make = runtime_directive.clear_make
         runtime_country_intent_detected = runtime_directive.country_intent_detected
+        runtime_parallel_search_mode = runtime_directive.parallel_search_mode
+
+        if runtime_parallel_search_mode:
+            # For multi-intent turns, avoid leaking previous single-intent filters.
+            active_filters = {}
 
         if runtime_country_id_override is not None:
             active_filters["country_id"] = runtime_country_id_override
         if runtime_country_intent_detected and runtime_country_id_override is None:
             active_filters.pop("country_id", None)
-        if runtime_clear_make or runtime_country_intent_detected:
+        if runtime_clear_make:
             active_filters.pop("make", None)
+        if isinstance(runtime_make_override, str) and runtime_make_override.strip():
+            active_filters["make"] = runtime_make_override.strip()
     else:
         turns = int(state_ctx.get("quote_agent_turns", 0)) + 1
         runtime_country_id_override = state_ctx.get("runtime_country_id_override")
+        runtime_make_override = state_ctx.get("runtime_make_override")
         runtime_clear_make = bool(state_ctx.get("runtime_clear_make", False))
         runtime_country_intent_detected = bool(state_ctx.get("runtime_country_intent_detected", False))
+        runtime_parallel_search_mode = bool(state_ctx.get("runtime_parallel_search_mode", False))
 
     state_updates = {
         "route": "quote_agent",
@@ -759,8 +881,10 @@ def quote_agent_node(state: CarSalesState) -> CarSalesState:
         "quote_agent_turns": turns,
         "quote_agent_human_count": human_count,
         "runtime_country_id_override": runtime_country_id_override,
+        "runtime_make_override": runtime_make_override,
         "runtime_clear_make": runtime_clear_make,
         "runtime_country_intent_detected": runtime_country_intent_detected,
+        "runtime_parallel_search_mode": runtime_parallel_search_mode,
         "active_search_filters": active_filters,
     }
 
@@ -819,6 +943,14 @@ def quote_agent_node(state: CarSalesState) -> CarSalesState:
             + json.dumps(active_filters, ensure_ascii=False)
             + "."
         )
+    if runtime_parallel_search_mode:
+        runtime_rules.append(
+            "- The latest user message contains multiple independent search intents. "
+            "Run separate search_used_vehicles calls (one call per intent) in this turn."
+        )
+        runtime_rules.append(
+            "- Do not force one intent over the others, and do not mix constraints between intents."
+        )
     if runtime_country_id_override is not None:
         runtime_rules.append(
             f"- Replace any previous country filter and use country_id={runtime_country_id_override}."
@@ -828,8 +960,12 @@ def quote_agent_node(state: CarSalesState) -> CarSalesState:
             "- The user requested country/origin, but there is no valid country_id for this turn. "
             "Do not reuse previous country_id; ask for country clarification using catalog values before searching."
         )
-    if runtime_clear_make or runtime_country_intent_detected:
+    if runtime_clear_make:
         runtime_rules.append("- Do not apply a make filter unless the user explicitly asks for a brand.")
+    if isinstance(runtime_make_override, str) and runtime_make_override.strip():
+        runtime_rules.append(
+            f"- Enforce make={runtime_make_override.strip()} exactly; do not broaden results to other brands."
+        )
     runtime_rules.append(
         "- Avoid speculative chained searches (for example, trying brands on your own). "
         "If no results are found, explain active filters and request one concrete adjustment."
@@ -856,7 +992,22 @@ def quote_agent_node(state: CarSalesState) -> CarSalesState:
             )
         )
 
+    catalog_lookup_in_current_turn = _has_tool_result_in_current_turn(
+        state_ctx["messages"],
+        "list_available_vehicle_filters",
+    )
     response = _llm().bind_tools(QUOTE_TOOLS).invoke(prompt_messages + messages)
+    response = _enforce_quote_tool_call_policy(
+        response,
+        active_filters=active_filters,
+        runtime_country_id_override=runtime_country_id_override,
+        runtime_make_override=runtime_make_override,
+        runtime_clear_make=runtime_clear_make,
+        runtime_country_intent_detected=runtime_country_intent_detected,
+        runtime_parallel_search_mode=runtime_parallel_search_mode,
+        conversation_language=conversation_language,
+        catalog_lookup_in_current_turn=catalog_lookup_in_current_turn,
+    )
     return _merge_updates(sync_update, state_updates, {"messages": [response]})
 
 
@@ -928,8 +1079,6 @@ def contact_agent_node(state: CarSalesState) -> CarSalesState:
             },
         )
 
-    latest_user_text = _latest_human_text(state_ctx["messages"])
-
     contact_profile_raw = state_ctx.get("known_contact_profile")
     contact_profile = contact_profile_raw if isinstance(contact_profile_raw, dict) else None
     if not contact_profile:
@@ -942,11 +1091,10 @@ def contact_agent_node(state: CarSalesState) -> CarSalesState:
         else _extract_recent_vehicle_candidates(state_ctx["messages"])
     )
 
-    matched_candidate_ids = _match_vehicle_candidates(latest_user_text, recent_candidates)
     selected_vehicle_id = _safe_int(state_ctx.get("selected_vehicle_id"))
-
-    if selected_vehicle_id is None and len(matched_candidate_ids) == 1:
-        selected_vehicle_id = matched_candidate_ids[0]
+    if selected_vehicle_id is None and len(recent_candidates) == 1:
+        selected_vehicle_id = _safe_int(recent_candidates[0].get("id"))
+    if selected_vehicle_id is not None:
         state_updates["selected_vehicle_id"] = selected_vehicle_id
 
     runtime_rules: list[str] = []
@@ -965,17 +1113,11 @@ def contact_agent_node(state: CarSalesState) -> CarSalesState:
             f"- Target vehicle inferred from conversation memory: vehicle_id={selected_vehicle_id}."
         )
 
-    if matched_candidate_ids:
+    if len(recent_candidates) > 1 and selected_vehicle_id is None:
         runtime_rules.append(
-            "The latest user message matches these vehicles from recent results: "
-            + ", ".join(str(vehicle_id) for vehicle_id in matched_candidate_ids)
-            + "."
+            "There are multiple vehicles in recent quote context and no selected vehicle yet. "
+            "If the user asks for contact, request only minimal vehicle disambiguation."
         )
-        if len(matched_candidate_ids) > 1:
-            runtime_rules.append(
-                "There is more than one possible vehicle. Ask only for minimal vehicle disambiguation "
-                "(for example ID or year), without requesting already-known contact data again."
-            )
 
     prompt_messages = [SystemMessage(content=CONTACT_AGENT_SYSTEM_PROMPT)]
     prompt_messages.append(
@@ -1017,34 +1159,53 @@ def final_supervisor_node(state: CarSalesState) -> CarSalesState:
         return _merge_updates(sync_update, {"conversation_language": conversation_language})
 
     revised_text = draft_text
-    if os.getenv("OPENAI_API_KEY"):
+    use_llm_rewriter = os.getenv("FINAL_SUPERVISOR_USE_LLM", "true").strip().lower() == "true"
+    if use_llm_rewriter and os.getenv("OPENAI_API_KEY"):
         try:
-            revised_response = _llm().invoke(
-                [
-                    SystemMessage(content=FINAL_RESPONSE_SYSTEM_PROMPT),
+            latest_user_text = _latest_human_text(messages).strip()
+            active_filters = state_ctx.get("active_search_filters")
+            supervisor_context: list[BaseMessage] = [
+                SystemMessage(content=FINAL_RESPONSE_SYSTEM_PROMPT),
+                SystemMessage(
+                    content=(
+                        f"Conversation language code is `{conversation_language}`. "
+                        "Write the final customer answer in that same language."
+                    )
+                ),
+            ]
+            if latest_user_text:
+                supervisor_context.append(
                     SystemMessage(
                         content=(
-                            f"Conversation language code is `{conversation_language}`. "
-                            "Write the final customer answer in that same language."
+                            "Latest user request that must be respected exactly:\n"
+                            f"{latest_user_text}"
                         )
-                    ),
-                    HumanMessage(content=draft_text),
-                ]
+                    )
+                )
+            if isinstance(active_filters, dict) and active_filters:
+                supervisor_context.append(
+                    SystemMessage(
+                        content=(
+                            "Active search filters used by the system (internal reference only):\n"
+                            f"{json.dumps(active_filters, ensure_ascii=False)}"
+                        )
+                    )
+                )
+            revised_response = _llm().invoke(
+                supervisor_context + [HumanMessage(content=draft_text)]
             )
             revised_text = _message_content_as_text(revised_response.content).strip() or draft_text
         except Exception:
             revised_text = draft_text
 
-    sanitized_text = _sanitize_final_response_text(revised_text)
-    if not sanitized_text:
-        sanitized_text = _sanitize_final_response_text(draft_text)
-    if not sanitized_text:
-        sanitized_text = draft_text
+    final_text = " ".join(str(revised_text).split()).strip() or " ".join(str(draft_text).split()).strip()
+    if not final_text:
+        final_text = draft_text
 
-    if sanitized_text == draft_text:
+    if final_text == draft_text:
         return _merge_updates(sync_update, {"conversation_language": conversation_language})
 
-    replacement_message = AIMessage(content=sanitized_text, id=last_message_id)
+    replacement_message = AIMessage(content=final_text, id=last_message_id)
     return _merge_updates(
         sync_update,
         {
